@@ -8,6 +8,7 @@ with open("README.md") as f:
 # Runtime requirements.
 inst_reqs = [
     "attrs",
+    "aiocogeo",
     "boto3",
     "numexpr",
     "numpy",

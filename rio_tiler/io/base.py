@@ -21,16 +21,6 @@ class BaseReader(metaclass=abc.ABCMeta):
     minzoom: int = attr.ib(init=False)
     maxzoom: int = attr.ib(init=False)
 
-    @abc.abstractmethod
-    def __enter__(self):
-        """Support using with Context Managers."""
-        ...
-
-    @abc.abstractmethod
-    def __exit__(self, exc_type, exc_value, traceback):
-        """Support using with Context Managers."""
-        ...
-
     @property
     def center(self) -> Tuple[float, float, int]:
         """Dataset center + minzoom."""
@@ -92,11 +82,40 @@ class BaseReader(metaclass=abc.ABCMeta):
         ...
 
 
+class SyncBaseReader(BaseReader, metaclass=abc.ABCMeta):
+    """Rio-tiler.io SyncBaseReader."""
+
+    @abc.abstractmethod
+    def __enter__(self):
+        """Support using with Context Managers."""
+        ...
+
+    @abc.abstractmethod
+    def __exit__(self, exc_type, exc_value, traceback):
+        """Support using with Context Managers."""
+        ...
+
+
 @attr.s
-class MultiBaseReader(BaseReader, metaclass=abc.ABCMeta):
+class AsyncBaseReader(BaseReader, metaclass=abc.ABCMeta):
+    """Rio-tiler.io AsyncBaseReader."""
+
+    @abc.abstractmethod
+    async def __aenter__(self):
+        """Support using with Context Managers."""
+        ...
+
+    @abc.abstractmethod
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        """Support using with Context Managers."""
+        ...
+
+
+@attr.s
+class MultiBaseReader(SyncBaseReader, metaclass=abc.ABCMeta):
     """MultiBaseReader Reader."""
 
-    reader: Type[BaseReader] = attr.ib()
+    reader: Type[SyncBaseReader] = attr.ib()
     reader_options: Dict = attr.ib(factory=dict)
     bounds: Tuple[float, float, float, float] = attr.ib(init=False)
     assets: Sequence[str] = attr.ib(init=False)

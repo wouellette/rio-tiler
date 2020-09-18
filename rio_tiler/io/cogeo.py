@@ -1,5 +1,6 @@
 """rio_tiler.io.cogeo: raster processing."""
 
+import math
 import warnings
 from concurrent import futures
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
@@ -8,22 +9,26 @@ import attr
 import mercantile
 import numpy
 import rasterio
+from aiocogeo import COGReader as _AsyncCogReader
+from PIL import Image
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.io import DatasetReader, DatasetWriter, MemoryFile
+from rasterio.transform import from_bounds
 from rasterio.vrt import WarpedVRT
-from rasterio.warp import transform_bounds
+from rasterio.warp import calculate_default_transform, reproject, transform_bounds
+from rasterio.warp import transform_geom as transform_coords
 
 from .. import constants, reader
 from ..errors import ExpressionMixingWarning, TileOutsideBounds
 from ..expression import apply_expression, parse_expression
-from ..mercator import get_zooms
+from ..mercator import get_zooms, zoom_for_pixelsize
 from ..utils import has_alpha_band, has_mask_band, tile_exists
-from .base import BaseReader
+from .base import AsyncBaseReader, SyncBaseReader
 
 
 @attr.s
-class COGReader(BaseReader):
+class COGReader(SyncBaseReader):
     """
     Cloud Optimized GeoTIFF Reader.
 
@@ -491,6 +496,181 @@ class COGReader(BaseReader):
             point = apply_expression(blocks, bands, point).tolist()
 
         return point
+
+
+@attr.s
+class AsyncCogReader(AsyncBaseReader):
+    """Asynchronous cog reader"""
+
+    filepath: str = attr.ib()
+    cog: _AsyncCogReader = attr.ib(default=None)
+    profile: Dict[str, Any] = attr.ib(default=None)
+
+    def _get_zooms(self, tilesize: int = 256):
+        """get zooms"""
+        dst_affine, w, h = calculate_default_transform(
+            CRS.from_epsg(self.cog.epsg),
+            constants.WEB_MERCATOR_CRS,
+            self.profile["width"],
+            self.profile["height"],
+            *self.cog.bounds,
+        )
+        mercator_resolution = max(abs(dst_affine[0]), abs(dst_affine[4]))
+        max_zoom = zoom_for_pixelsize(mercator_resolution, tilesize=tilesize)
+        ovr_resolution = mercator_resolution * max(h, w) / tilesize
+        min_zoom = zoom_for_pixelsize(ovr_resolution, tilesize=tilesize)
+        return (min_zoom, max_zoom)
+
+    async def __aenter__(self):
+        """context manager"""
+        self.cog = await _AsyncCogReader(
+            filepath=self.filepath, kwargs={"session": self.session}
+        ).__aenter__()
+        self.profile = self.cog.profile
+        self.bounds = transform_bounds(
+            CRS.from_epsg(self.cog.epsg),
+            constants.WGS84_CRS,
+            *self.cog.bounds,
+            densify_pts=21,
+        )
+        self.minzoom, self.maxzoom = self._get_zooms()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """context manager"""
+        await self.cog.__aexit__(exc_type, exc_val, exc_tb)
+
+    async def _warped_read(
+        self,
+        bounds: Tuple[int, int, int, int],
+        width: int,
+        height: int,
+        bounds_crs: CRS,
+        resample_method: int = Image.NEAREST,
+    ) -> numpy.ndarray:
+        """read tile with crs handling"""
+        src_transform = from_bounds(*bounds, width=width, height=height)
+        bounds = transform_bounds(bounds_crs, CRS.from_epsg(self.cog.epsg), *bounds)
+        dst_transform = from_bounds(*bounds, width=width, height=height)
+        arr = await self.cog.read(
+            bounds, shape=(width, height), resample_method=resample_method
+        )
+        arr, _ = reproject(
+            arr,
+            destination=numpy.empty((self.profile["count"], width, height)),
+            src_transform=dst_transform,
+            dst_transform=src_transform,
+            src_crs=CRS.from_epsg(self.cog.epsg),
+            dst_crs=bounds_crs,
+        )
+        return arr.astype(self.profile["dtype"])
+
+    async def info(self) -> Dict:  # type:ignore
+        """info"""
+        # TODO: Add nodata_type
+        return {
+            "bounds": self.bounds,
+            "center": self.center,
+            "minzoom": self.minzoom,
+            "maxzoom": self.maxzoom,
+            "dtype": self.profile["dtype"],
+            "colorinterp": self.profile["photometric"],
+        }
+
+    async def metadata(  # type: ignore
+        self, pmin: float = 2.0, pmax: float = 98.0, **kwargs: Any,
+    ) -> Dict:
+        """metadata"""
+        # TODO: Add stats
+        return await self.info()
+
+    async def part(  # type: ignore
+        self,
+        bbox: Tuple[float, float, float, float],
+        dst_crs: Optional[CRS] = None,
+        bounds_crs: CRS = constants.WGS84_CRS,
+        width: int = None,
+        height: int = None,
+    ) -> Tuple[numpy.ndarray, numpy.ndarray]:
+        """part"""
+        if bounds_crs != self.cog.epsg:
+            bounds = transform_bounds(bounds_crs, CRS.from_epsg(self.cog.epsg), *bbox)
+
+        if not width or not height:
+            width = math.ceil((bounds[2] - bounds[0]) / self.profile["transform"].a)
+            height = math.ceil((bounds[3] - bounds[1]) / -self.profile["transform"].e)
+
+        arr = await self.cog.read(bounds=bounds, shape=(width, height))
+        return arr.data, arr.mask
+
+    async def point(self, lon: float, lat: float, **kwargs: Any) -> List:  # type: ignore
+        """point"""
+        coords = [
+            pt[0]
+            for pt in transform_coords(
+                constants.WGS84_CRS, CRS.from_epsg(self.cog.epsg), [lon], [lat]
+            )
+        ]
+        arr = await self.cog.point(*coords)
+        return list(arr)
+
+    async def preview(  # type: ignore
+        self,
+        height: int = None,
+        width: int = None,
+        max_size: int = None,
+        resample_method: int = Image.NEAREST,
+    ) -> Tuple[numpy.ndarray, numpy.ndarray]:
+        """preview"""
+        # https://github.com/cogeotiff/rio-tiler/blob/master/rio_tiler/reader.py#L293-L303
+        if not height and not width:
+            if max(self.profile["height"], self.profile["width"]) < max_size:
+                height, width = self.profile["height"], self.profile["width"]
+            else:
+                ratio = self.profile["height"] / self.profile["width"]
+                if ratio > 1:
+                    height = max_size
+                    width = math.ceil(height / ratio)
+                else:
+                    width = max_size
+                    height = math.ceil(width * ratio)
+        return await self.cog.read(
+            bounds=self.cog.bounds,
+            shape=(width, height),
+            resample_method=resample_method,
+        )
+
+    async def stats(self, pmin: float = 2.0, pmax: float = 98.0, **kwargs: Any) -> Dict:  # type: ignore
+        """stats"""
+        # TODO
+        raise NotImplementedError
+
+    async def tile(  # type: ignore
+        self,
+        tile_x: int,
+        tile_y: int,
+        tile_z: int,
+        tilesize: int = 256,
+        resample_method: int = Image.NEAREST,
+        **kwargs: Any,
+    ) -> Tuple[numpy.ndarray, numpy.ndarray]:
+        """tile"""
+        tile = mercantile.Tile(x=tile_x, y=tile_y, z=tile_z)
+        tile_bounds = mercantile.xy_bounds(tile)
+        width = height = tilesize
+        if self.cog.epsg != constants.WEB_MERCATOR_CRS:
+            arr = await self._warped_read(
+                tile_bounds,
+                width,
+                height,
+                bounds_crs=constants.WEB_MERCATOR_CRS,
+                resample_method=resample_method,
+            )
+        else:
+            arr = await self.cog.read(
+                tile_bounds, shape=(width, height), resample_method=resample_method
+            )
+        return arr
 
 
 def multi_tile(
