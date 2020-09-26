@@ -10,7 +10,7 @@ import requests
 
 from ..errors import InvalidAssetName, MissingAssets
 from ..utils import aws_get_object
-from .base import MultiBaseReader, SyncBaseReader
+from .base import BaseReader, MultiBaseReader
 from .cogeo import COGReader
 
 DEFAULT_VALID_TYPE = {
@@ -153,7 +153,7 @@ class STACReader(MultiBaseReader):
     exclude_assets: Optional[Set[str]] = attr.ib(default=None)
     include_asset_types: Set[str] = attr.ib(default=DEFAULT_VALID_TYPE)
     exclude_asset_types: Optional[Set[str]] = attr.ib(default=None)
-    reader: Type[SyncBaseReader] = attr.ib(default=COGReader)
+    reader: Type[BaseReader] = attr.ib(default=COGReader)
     reader_options: Dict = attr.ib(factory=dict)
 
     def __enter__(self):
